@@ -23,13 +23,14 @@ pub enum IRBinop {
 }
 
 // We keep this field separate so that it may fail on unsupported versions
-const version: u8 = 0x00;
+const version: u8 = 0x01;
 #[derive(Clone, Copy)]
 pub struct IRSections {
     pub extern_section: u64,
     pub data_section: u64,
     pub globals_section: u64,
-    pub functs_section: u64
+    pub functs_section: u64,
+    pub string_table: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -40,7 +41,7 @@ pub struct IRString {
 #[derive(Clone, Copy)]
 pub struct IRExterns {
     pub count: u64,
-    pub externs: Array<IRString>
+    pub externs: Array<u64> // Index in String Table
 }
 #[derive(Clone, Copy)]
 pub struct IRData {
@@ -50,7 +51,7 @@ pub struct IRData {
 
 #[derive(Clone, Copy)]
 pub enum IRValue {
-    Name(IRString),
+    Name(u64),
     Literal(u64),
     Offset(u64),
 }
@@ -58,7 +59,7 @@ pub enum IRValue {
 // TODO: Parse to a straight Global
 #[derive(Clone, Copy)]
 pub struct IRGlobal {
-    pub name: IRString,
+    pub name: u64,
     pub values: Array<IRValue>,
 
     pub is_vec: bool,
@@ -70,11 +71,11 @@ pub enum IROpArg {
     Bogus,
     AutoVar(u64),           // ID=0x01
     Deref(u64),             // ID=0x02
-    RefExternal(IRString),  // ID=0x03
+    RefExternal(u64),       // ID=0x03
     RefAutoVar(u64),        // ID=0x04
     Literal(u64),           // ID=0x05
     DataOffset(u64),        // ID=0x06
-    External(IRString),     // ID=0x07
+    External(u64),          // ID=0x07
 }
 
 #[derive(Clone, Copy)]
@@ -99,8 +100,8 @@ pub enum IROpcode {
 #[derive(Clone, Copy)]
 pub struct IRFunction {
     // TODO
-    pub name: IRString,
-    pub file: IRString,
+    pub name: u64,
+    pub file: u64,
 
     pub params: u64,
     pub autovars: u64,
@@ -113,14 +114,14 @@ pub struct IRFunction {
 
 #[derive(Clone, Copy)]
 pub struct IRInfo {
-    pub source: *mut String_Builder,
+   pub source: *mut String_Builder,
     pub sections: IRSections,
 
     pub externs: IRExterns,
     pub data: IRData,
     pub globals: Array<IRGlobal>,
-    pub functions: Array<IRFunction>
-
+    pub functions: Array<IRFunction>,
+    pub string_table: Array<IRString>
 }
 
 pub unsafe fn load8(output: *mut String_Builder, offset: usize) -> u8 {
@@ -156,9 +157,9 @@ pub unsafe fn load_externs(ir: *mut IRInfo) {
 
     offset += 8;
     for _ in 0u64..externs {
-        let string: IRString = loadstr((*ir).source, offset);
-        da_append(&mut (*ir).externs.externs, string);
-        offset += (8 + string.length) as usize;
+        let index = load64((*ir).source, offset);
+        da_append(&mut (*ir).externs.externs, index);
+        offset += 8 as usize;
     }
     (*ir).externs.count = externs;
 }
@@ -181,13 +182,13 @@ pub unsafe fn load_globals(ir: *mut IRInfo) {
 
     for _ in 0u64..count {
         // Try loading a global value
-        let name: IRString = loadstr((*ir).source, offset);
-        offset += (8 + name.length) as usize;
+        let name_index = load64((*ir).source, offset);
+        offset += 8;
         let count: u64 = load64((*ir).source, offset);
         offset += 8;
         let mut global: IRGlobal = zeroed();
 
-        global.name = name;
+        global.name = name_index;
         global.values = zeroed();
         
         for __ in 0..count {
@@ -195,9 +196,9 @@ pub unsafe fn load_globals(ir: *mut IRInfo) {
             let global_val: IRValue;
             offset += 1;
             if kind == 0x00 {
-                let vname: IRString = loadstr((*ir).source, offset);
+                let vname = load64((*ir).source, offset);
                 global_val = IRValue::Name(vname);
-                offset += (8 + vname.length) as usize;
+                offset += 8
             } else if kind == 0x01 {
                 let literal: u64 = load64((*ir).source, offset);
                 offset += 8;
@@ -229,8 +230,8 @@ pub unsafe fn parse_funcarg(ir: *mut IRInfo, offset: *mut usize) -> Option<IROpA
 
     return match arg_byte {
         0x00 => {
-            let fname: IRString = loadstr((*ir).source, *offset);
-            *offset += (8 + fname.length) as usize;
+            let fname = load64((*ir).source, *offset);
+            *offset += 8;
             Some(IROpArg::External(fname))
         }
         0x01 => parse_argument(ir, offset),
@@ -269,32 +270,15 @@ pub unsafe fn parse_argument(ir: *mut IRInfo, offset: *mut usize) -> Option<IROp
             Some(IROpArg::DataOffset(word))
         }
         0x03 => {
-            /* strings are always prefixed by a size field */
-            let length = load64((*ir).source, *offset);
-            let mut irstring: IRString = zeroed();
+            let irstring = load64((*ir).source, *offset);
             *offset += 8;
-
-            irstring.length = length;
-            /* Parse the next length characters as a string */
-            for i in 0..length {
-                da_append(&mut irstring.content, load8((*ir).source, (*offset) + i as usize) as c_char);
-            }
-            *offset += length as usize;
 
             Some(IROpArg::RefExternal(irstring))
         }
         0x07 => {
             /* strings are always prefixed by a size field */
-            let length = load64((*ir).source, *offset);
-            let mut irstring: IRString = zeroed();
+            let irstring = load64((*ir).source, *offset);
             *offset += 8;
-
-            irstring.length = length;
-            /* Parse the next length characters as a string */
-            for i in 0..length {
-                da_append(&mut irstring.content, load8((*ir).source, (*offset) + i as usize) as c_char);
-            }
-            *offset += length as usize;
 
             Some(IROpArg::External(irstring))
         }
@@ -331,11 +315,10 @@ pub unsafe fn load_functions(ir: *mut IRInfo) {
         // TODO: Load function
         let mut function: IRFunction = zeroed();
 
-        function.name = loadstr((*ir).source, offset);
-        offset += (8 + function.name.length) as usize;
-        function.file = loadstr((*ir).source, offset);
-        offset += (8 + function.file.length) as usize;
-
+        function.name = load64((*ir).source, offset);
+        offset += 8;
+        function.file = load64((*ir).source, offset);
+        offset += 8;
         function.params = load64((*ir).source, offset);
         offset += 8;
         function.autovars = load64((*ir).source, offset);
@@ -371,12 +354,12 @@ pub unsafe fn load_functions(ir: *mut IRInfo) {
                 },
                 0x03 => {
                     // ExternSet (str, arg)
-                    let lhs = loadstr((*ir).source, offset);
-                    offset += (8 + lhs.length) as usize;
-                    printf(c!("%04X (%s)\n"), offset as c_int, lhs.content.items);
+                    let lhs = load64((*ir).source, offset);
+                    offset += 8;
+                    printf(c!("%04X (%lu in string table)\n"), offset as c_int, lhs);
                     let rhs_opt = parse_argument(ir, &mut offset);
                     if let Some(rhs) = rhs_opt {
-                        printf(c!("setting %s\n"), lhs.content.items);
+                        printf(c!("setting %lu\n"), lhs);
                         opcode = IROpcode::ExtrnSet(IROpArg::External(lhs), rhs);
                     } else {
                         unreachable!("invalid argument");
@@ -467,6 +450,17 @@ pub unsafe fn load_functions(ir: *mut IRInfo) {
     (*ir).data.length = count;
 }
 
+pub unsafe fn load_string_table(ir: *mut IRInfo) {
+    let mut offset: usize = (*ir).sections.string_table as usize;
+    let count = load64((*ir).source, offset);
+    offset += 8;
+    for _ in 0..count {
+        let str = loadstr((*ir).source, offset);
+        da_append(&mut (*ir).string_table, str);
+        offset += (8 + str.length) as usize; 
+    }
+}
+
 pub unsafe fn load_bytecode(ir: *mut IRInfo, output: *mut String_Builder, bytecode_path: *const c_char) -> Option<()> {
     read_entire_file(bytecode_path, output)?;
     let magic: [u8;2] = [ *((*output).items.add(0)) as u8, *((*output).items.add(1)) as u8 ];
@@ -482,6 +476,8 @@ pub unsafe fn load_bytecode(ir: *mut IRInfo, output: *mut String_Builder, byteco
 
         // Start loading the sections
         off -= 8;
+        (*ir).sections.string_table = load64(output, off);
+        off -= 8;
         (*ir).sections.functs_section = load64(output, off);
         off -= 8;
         (*ir).sections.globals_section = load64(output, off);
@@ -489,8 +485,9 @@ pub unsafe fn load_bytecode(ir: *mut IRInfo, output: *mut String_Builder, byteco
         (*ir).sections.data_section = load64(output, off);
         off -= 8;
         (*ir).sections.extern_section = load64(output, off);
-
+        
         // Now, start loading each substructure
+        load_string_table(ir);
         load_externs(ir);
         load_data(ir);
         load_globals(ir);
@@ -508,11 +505,16 @@ pub unsafe fn argument_to_value(_ir: *mut IRInfo, autozone: *mut Array<u64>, arg
         _ => { return None; }
     };
 }
+
+pub unsafe fn get_string(ir: *mut IRInfo, index: u64) -> IRString {
+    *(*ir).string_table.items.add(index as usize)
+}
+
 pub unsafe fn call_function(ir: *mut IRInfo, name: *const c_char, args: *const Array<u64>) -> u64 {
     // Start by locating that function
     for i in 0..(*ir).functions.count {
         let func: *const IRFunction = (*ir).functions.items.add(i);
-        if strcmp((*func).name.content.items, name) == 0 {
+        if strcmp(get_string(ir, (*func).name).content.items, name) == 0 {
             // Initialise the autozone
             let mut autozone: Array<u64> = zeroed();
             for j in 0..(*func).autovars {
